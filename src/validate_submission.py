@@ -64,18 +64,37 @@ def validate_submission_files(
         return False
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Validate competition submission files.")
-    parser.add_argument("--matching", "-m", default="output/matching_results.tsv", help="Path to matching_results.tsv")
-    parser.add_argument("--candidate", "-c", default="output/candidate_pairs.tsv", help="Path to candidate_pairs.tsv")
-    parser.add_argument("--test-dir", "-t", default="dataset/test", help="Path to test dataset directory")
-    parser.add_argument("--check-ids", action="store_true", help="Perform comprehensive ID existence check")
-    args = parser.parse_args()
 
-    success = validate_submission_files(
-        matching_file=args.matching,
-        candidate_file=args.candidate,
-        test_dir=args.test_dir,
-        check_ids=args.check_ids,
-    )
-    sys.exit(0 if success else 1)
+
+def validate_report_file(report_path: str) -> bool:
+    """Validate that the evaluation report CSV contains required columns and no NaNs.
+    Returns True if the file is valid, False otherwise.
+    """
+    import pandas as pd
+    required_cols = {
+        "experiment_id",
+        "mode",
+        "macro_f05",
+        "macro_precision",
+        "macro_recall",
+        "total_entities",
+        "singletons_accuracy",
+    }
+    if not os.path.isfile(report_path):
+        print(f"[FAIL] Report file not found: {report_path}")
+        return False
+    try:
+        df = pd.read_csv(report_path)
+    except Exception as e:
+        print(f"[FAIL] Could not read report CSV: {e}")
+        return False
+    missing = required_cols - set(df.columns)
+    if missing:
+        print(f"[FAIL] Report missing required columns: {missing}")
+        return False
+    if df.isnull().any().any():
+        print("[FAIL] Report contains NaN values.")
+        return False
+    print("[PASS] Evaluation report validation passed.")
+    return True
+

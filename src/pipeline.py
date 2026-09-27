@@ -19,7 +19,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from src.blocking import generate_blocking_keys
+from src.blocking import generate_blocking_keys, generate_candidate_pairs
 from src.data import load_ground_truth, load_source_data, save_results
 from src.evaluate import (
     compute_candidate_recall,
@@ -160,6 +160,7 @@ def run_validation_pipeline(
     data_dir: str = "dataset/val_sample",
     output_dir: str = "outputs/val_run",
     model_save_path: str = "outputs/model.joblib",
+    max_per_s1: int = 30,
 ) -> None:
     """Execute validation flow: blocking -> feature engineering -> training -> tuning -> evaluation."""
     print("=" * 70)
@@ -179,7 +180,7 @@ def run_validation_pipeline(
     gt_map = load_ground_truth(gt_path)
 
     # 2. Blocking
-    df_candidates, pair_list = generate_candidate_pairs_fast(df_s1, df_s2, df_s3)
+    df_candidates, pair_list = generate_candidate_pairs(df_s1, df_s2, df_s3, top_k_per_source=max_per_s1)
     cand_file = os.path.join(output_dir, "candidate_pairs.tsv")
     save_results(df_candidates, cand_file, col_name="candidate_entity_ids")
 
@@ -300,6 +301,7 @@ def run_test_pipeline(
     output_dir: str = "output",
     model_path: str = "outputs/model.joblib",
     threshold: float = 0.50,
+    max_per_s1: int = 30,
 ) -> None:
     """Execute competition test inference and generate official submission files."""
     print("=" * 70, flush=True)
@@ -323,6 +325,8 @@ def run_test_pipeline(
     df_s3 = load_source_data(s3_path)
 
     all_s1_ids = set(df_s1["entity_id"])
+    # Generate candidate pairs for test using same blocking config
+    df_candidates, pair_list = generate_candidate_pairs(df_s1, df_s2, df_s3, top_k_per_source=max_per_s1)
     countries = sorted(list(df_s1["country"].unique()))
     print(f"Test entities to process: {len(all_s1_ids):,} across countries: {countries}", flush=True)
 
@@ -392,16 +396,18 @@ def run_test_pipeline(
                 chunk_s1["country"].fillna(""),
             ):
                 matched_cands: Set[str] = set()
-                for key in generate_blocking_keys(name, addr, c_name):
-                    if key in idx_s2:
-                        matched_cands.update(idx_s2[key])
-                    if key in idx_s3:
-                        matched_cands.update(idx_s3[key])
-
-                if len(matched_cands) > 100:
-                    cands_list = sorted(list(matched_cands))[:100]
-                else:
-                    cands_list = sorted(list(matched_cands))
+                # Use TF-IDF dual‑pass blocking for this country subset
+                df_cand_country, pair_list_country = generate_candidate_pairs(df_s1_c, df_s2_c, df_s3_c)
+                # Convert TF‑IDF output to the same structures expected downstream
+                cands_list = []
+                # df_cand_country has a column "candidate_entity_ids" (comma‑separated)
+                for _, row in df_cand_country.iterrows():
+                    cand_ids = row["candidate_entity_ids"].split(",") if row["candidate_entity_ids"] else []
+                    # Limit to 100 candidates per source1 entity to stay comparable
+                    cands_list.extend(cand_ids[:100])
+                # Build pair_list for scoring from the TF‑IDF output
+                pair_list = [(row["source1_entity_id"], cid) for _, row in df_cand_country.iterrows() for cid in row["candidate_entity_ids"].split(",") if cid]
+                # Note: the original per‑entity loop variables (eid, name, ...) are no longer needed
 
                 for cid in cands_list:
                     pair_list_chunk.append((eid, cid))
@@ -474,16 +480,69 @@ def main():
     parser.add_argument("--data-dir", default=None, help="Custom data directory")
     parser.add_argument("--output-dir", default=None, help="Custom output directory")
     parser.add_argument("--threshold", type=float, default=0.45, help="Classification threshold for test inference")
+    parser.add_argument("--max-per-s1", type=int, default=30, help="Maximum candidates per source1 entity (blocking top_k)")
+    # New arguments
+    parser.add_argument("--experiment-id", type=str, default=None, help="Unique experiment identifier (auto‑generated if omitted)")
+    parser.add_argument("--report", type=str, default=None, help="Path to CSV file where overall and per‑country evaluation metrics will be saved")
     args = parser.parse_args()
+
+    # Guard against accidental leakage: validation must not point at a test directory
+    if args.mode == "val" and args.data_dir and ("test" in args.data_dir.lower() or "test_" in args.data_dir.lower()):
+        raise RuntimeError("Validation mode cannot be run on a test data directory – this would cause train‑on‑eval leakage.")
+
+    # Generate experiment ID if not supplied
+    if not args.experiment_id:
+        import uuid
+        args.experiment_id = str(uuid.uuid4())
+    # Log experiment start (tracker already provides log_experiment)
+    from src.tracker import log_experiment
+    log_experiment(args.experiment_id, args.mode, args.data_dir, args.output_dir)
 
     if args.mode == "val":
         data_dir = args.data_dir or "dataset/val_sample"
         output_dir = args.output_dir or "outputs/val_run"
-        run_validation_pipeline(data_dir=data_dir, output_dir=output_dir)
+        run_validation_pipeline(data_dir=data_dir, output_dir=output_dir, max_per_s1=args.max_per_s1)
     else:
         data_dir = args.data_dir or "dataset/test"
         output_dir = args.output_dir or "output"
-        run_test_pipeline(data_dir=data_dir, output_dir=output_dir, threshold=args.threshold)
+        run_test_pipeline(data_dir=data_dir, output_dir=output_dir, threshold=args.threshold, max_per_s1=args.max_per_s1)
+
+    # After pipeline finishes, optionally generate CSV report
+    if args.report:
+        import pandas as pd
+        pred_path = os.path.join(output_dir, "matching_results.tsv")
+        gt_file = os.path.join(data_dir, "train_ground_truth.tsv" if args.mode == "val" else "test_ground_truth.tsv")
+        from src.evaluate import load_mapping_from_tsv, evaluate_predictions
+        preds = load_mapping_from_tsv(pred_path, "source1_entity_id", "matched_entity_ids")
+        gt = load_mapping_from_tsv(gt_file, "source1_entity_id", "matched_entity_ids")
+        eval_res = evaluate_predictions(preds, gt)
+        overall_df = pd.DataFrame([{
+            "experiment_id": args.experiment_id,
+            "mode": args.mode,
+            "macro_f05": eval_res.get("macro_f05"),
+            "macro_precision": eval_res.get("macro_precision"),
+            "macro_recall": eval_res.get("macro_recall"),
+            "total_entities": eval_res.get("total_entities"),
+            "singletons_accuracy": eval_res.get("singletons_accuracy"),
+        }])
+        if "countries" in eval_res:
+            country_rows = []
+            for country, stats in eval_res["countries"].items():
+                country_rows.append({
+                    "experiment_id": args.experiment_id,
+                    "mode": args.mode,
+                    "country": country,
+                    "macro_f05": stats.get("macro_f05"),
+                    "macro_precision": stats.get("macro_precision"),
+                    "macro_recall": stats.get("macro_recall"),
+                    "entity_count": stats.get("count"),
+                })
+            country_df = pd.DataFrame(country_rows)
+            report_df = pd.concat([overall_df, country_df], ignore_index=True, sort=False)
+        else:
+            report_df = overall_df
+        report_df.to_csv(args.report, index=False)
+        print(f"Evaluation report saved to: {args.report}")
 
 
 if __name__ == "__main__":

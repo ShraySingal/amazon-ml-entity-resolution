@@ -159,6 +159,70 @@ def evaluate_predictions(
 
     return results
 
+# --------------------------
+# Metric Helper Functions
+# --------------------------
+
+def macro_average(metric_dict: Dict[str, float]) -> float:
+    """Return the macro‑averaged value of a metric across all entities.
+    The input is a dict mapping entity IDs to a per‑entity metric value.
+    """
+    if not metric_dict:
+        return 0.0
+    return sum(metric_dict.values()) / len(metric_dict)
+
+def micro_average(true_counts: int, pred_counts: int, tp_counts: int) -> float:
+    """Return the micro‑averaged precision, recall, and F0.5 as a tuple.
+    This helper is not used directly in the main evaluation but provides
+    a convenient way to compute micro metrics when counts are known.
+    """
+    precision = tp_counts / pred_counts if pred_counts > 0 else 0.0
+    recall = tp_counts / true_counts if true_counts > 0 else 0.0
+    denom = (0.25 * precision) + recall
+    f05 = (1.25 * precision * recall) / denom if denom > 0 else 0.0
+    return precision, recall, f05
+
+def singleton_accuracy(true_singletons: int, correct_singletons: int) -> float:
+    """Return the accuracy for singleton entities.
+    If there are no singletons, returns 1.0 (vacuously true).
+    """
+    return correct_singletons / true_singletons if true_singletons > 0 else 1.0
+
+# --------------------------
+# Candidate Recall per Country
+# --------------------------
+
+def compute_candidate_recall_by_country(
+    candidates_map: Dict[str, Set[str]],
+    ground_truth_map: Dict[str, Set[str]],
+    country_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, float]:
+    """Compute candidate recall broken down by country.
+    Returns a dict mapping country code -> recall value.
+    If `country_map` is None, returns an empty dict.
+    """
+    if not country_map:
+        return {}
+    # Accumulate true matches and captured matches per country
+    country_true: Dict[str, int] = {}
+    country_captured: Dict[str, int] = {}
+    for s1_id, true_set in ground_truth_map.items():
+        if not true_set:
+            continue
+        country = country_map.get(s1_id)
+        if not country:
+            continue
+        cand_set = candidates_map.get(s1_id, set())
+        captured = len(true_set.intersection(cand_set))
+        country_true[country] = country_true.get(country, 0) + len(true_set)
+        country_captured[country] = country_captured.get(country, 0) + captured
+    # Compute recall per country
+    recall_by_country: Dict[str, float] = {}
+    for c, true_cnt in country_true.items():
+        captured_cnt = country_captured.get(c, 0)
+        recall_by_country[c] = captured_cnt / true_cnt if true_cnt > 0 else 0.0
+    return recall_by_country
+
 
 def compute_candidate_recall(
     candidates_map: Dict[str, Set[str]],

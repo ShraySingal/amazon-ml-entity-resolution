@@ -122,6 +122,7 @@ def main():
     parser.add_argument("--source1", "-s1", required=True, help="Path to Source 1 TSV to guarantee all entities are represented")
     parser.add_argument("--output", "-o", default=None, help="Optional path to export matching_results.tsv at best threshold")
     parser.add_argument("--report", "-r", default=None, help="Optional path to save threshold comparison CSV")
+    parser.add_argument("--max-per-s1", type=int, default=None, help="Cap candidate pairs per Source 1 entity before threshold sweep")
     args = parser.parse_args()
 
     # Load scores
@@ -131,6 +132,17 @@ def main():
     for col in ["source1_entity_id", "candidate_entity_id", "score"]:
         if col not in df_scores.columns:
             raise ValueError(f"Missing required column '{col}' in {args.scores}")
+    # Apply optional max_per_s1 limit to candidate pairs per Source 1 entity
+    if getattr(args, "max_per_s1", None):
+        max_k = args.max_per_s1
+        # Keep top-scoring candidates per source1_entity_id
+        df_scores = (
+            df_scores.sort_values(["source1_entity_id", "score"], ascending=[True, False])
+            .groupby("source1_entity_id")
+            .head(max_k)
+            .reset_index(drop=True)
+        )
+        print(f"Applied max_per_s1={max_k}: {len(df_scores)} candidate pairs remain after truncation.")
 
     # Load ground truth
     from src.evaluate import load_mapping_from_tsv
